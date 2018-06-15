@@ -3,12 +3,13 @@ package amigo
 import (
 	"container/list"
 	"math/rand"
-	"net"
 	"time"
 )
 
 type Bucket struct {
 	list *list.List
+
+	cache idCache
 
 	// upper limits of the list
 	cap int
@@ -17,11 +18,14 @@ type Bucket struct {
 	nextRefreshAt time.Time
 }
 
+type idCache = map[ID]struct{}
+
 func NewBucket(cap int) *Bucket {
 	return &Bucket{
 		cap:           cap,
 		list:          list.New(),
 		nextRefreshAt: time.Now().Add(10 * time.Minute),
+		cache:         make(idCache),
 	}
 }
 
@@ -45,6 +49,9 @@ func (b *Bucket) Refresh(isAlive AliveChecker) bool {
 		b.list.MoveToBack(front)
 	} else {
 		b.list.Remove(front)
+		if _, ok := b.cache[val.ID]; ok {
+			delete(b.cache, val.ID)
+		}
 	}
 
 	b.nextRefreshAt = time.Now().Add(10 * time.Minute)
@@ -56,9 +63,10 @@ func (b *Bucket) IsFull() bool {
 	return b.list.Len() == b.cap
 }
 
-func (b *Bucket) Append(v interface{}, isAlive AliveChecker) bool {
+func (b *Bucket) Append(v NodeInfo, isAlive AliveChecker) bool {
 	if !b.IsFull() {
 		b.list.PushBack(v)
+		b.cache[v.ID] = struct{}{}
 		return true
 	}
 
@@ -66,7 +74,11 @@ func (b *Bucket) Append(v interface{}, isAlive AliveChecker) bool {
 	ninfo := frt.Value.(NodeInfo)
 	if alive, _ := isAlive(ninfo.Address); !alive {
 		b.list.Remove(frt)
+		if _, ok := b.cache[ninfo.ID]; ok {
+			delete(b.cache, ninfo.ID)
+		}
 		b.list.PushBack(v)
+		b.cache[v.ID] = struct{}{}
 		return true
 	}
 
@@ -106,4 +118,5 @@ func (b *Bucket) Destroy() {
 	for i := b.list.Len(); i > 0; i-- {
 		b.list.Remove(b.list.Front())
 	}
+	b.cache = make(idCache)
 }

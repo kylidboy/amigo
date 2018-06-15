@@ -1,37 +1,37 @@
 package amigo
 
 import (
-	"bytes"
 	"math/big"
+	"math/rand"
 	"net"
+	"net/rpc"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
 )
 
 const (
-	K                 = 8
-	Alpha             = 3
-	ConnectionTimeout = 10
+	// K is just the k-bucket factor
+	K = 20
+
+	// Alpha is a system-wide currency factor
+	Alpha = 3
+
+	PingTimeout = 10 * time.Second
 )
 
 type (
+	// ID defines the the type of ID, fixed to [20]byte
 	ID [20]byte
 
-	// NodeInfo defines the data structure stored in Amigo
-	NodeInfo struct {
-		ID      ID
-		Address net.Addr
-		Data    interface{}
-	}
-
+	// Amigo
 	Amigo struct {
-		mtx     sync.Mutex
-		self    ID
-		total   int
-		buckets [160]*Bucket
+		mtx             sync.Mutex
+		self            ID
+		buckets         [160]*Bucket
+		closestNonEmpty int
 	}
 )
 
@@ -39,7 +39,7 @@ type AliveChecker func(addr net.Addr) (bool, error)
 
 var (
 	defaultAliveCheck AliveChecker = func(addr net.Addr) (bool, error) {
-		conn, err := net.DialTimeout(addr.Network(), addr.String(), ConnectionTimeout*time.Second)
+		conn, err := net.DialTimeout(addr.Network(), addr.String(), PingTimeout)
 		defer conn.Close()
 		if err != nil {
 			return false, err
@@ -57,7 +57,7 @@ LOOP:
 	for i := range self {
 		byteDist := self[i] ^ other[i]
 		for j := 7; j >= 0; j-- {
-			if (0x01<<uint(j))&byteDist == 1 {
+			if (0x01<<uint(j))&byteDist != 0x00 {
 				idx += 7 - j
 				break LOOP
 			}
@@ -76,7 +76,7 @@ func GetDistance(idA, idB ID) *big.Int {
 }
 
 func GetClosestTo(id ID, nodes []NodeInfo) (NodeInfo, *big.Int) {
-	closest := big.NewInt(0).SetBytes(bytes.Repeat([]byte{0xFF}, 20))
+	closest := GetDistance(id, nodes[0].ID)
 	idx := 0
 	for i, n := range nodes {
 		dist := GetDistance(id, n.ID)
@@ -90,12 +90,49 @@ func GetClosestTo(id ID, nodes []NodeInfo) (NodeInfo, *big.Int) {
 
 func NewAmigo(id ID) *Amigo {
 	return &Amigo{
-		self: id,
+		self:            id,
+		closestNonEmpty: -1,
 	}
 }
 
-func (a *Amigo) Print() {
+// GetKClosest get my own K closest nodes from local buckets
+func (a *Amigo) GetKClosest() []NodeInfo {
+	ret := make([]NodeInfo, 0, K)
+	idx := 0
+	if a.closestNonEmpty == -1 {
+		idx = len(a.buckets) - 1
+	} else {
+		idx = a.closestNonEmpty
+	}
+	for ; idx >= 0 && len(ret) < K; idx-- {
+		if a.buckets[idx] != nil && a.buckets[idx].Size() > 0 {
+			ret = append(ret, a.buckets[idx].GetN(Alpha-len(ret))...)
+		}
+	}
+	return ret
+}
 
+// GetKClosestTo get K closest nodes to the target id, and return a slice with K items
+// TODO: use a better sort algorithm
+func (a *Amigo) GetKClosestTo(target ID, nodes []NodeInfo) []NodeInfo {
+	if len(nodes) <= K {
+		return nodes
+	}
+
+	for j := 0; j < K; j++ {
+		closest := GetDistance(a.self, nodes[j].ID)
+		idx := j
+		for i := j + 1; i < len(nodes); i++ {
+			dist := GetDistance(a.self, nodes[i].ID)
+			if closest.Cmp(dist) == 1 {
+				closest = dist
+				idx = i
+			}
+		}
+		nodes[j], nodes[idx] = nodes[idx], nodes[j]
+	}
+
+	return nodes[:K]
 }
 
 func (a *Amigo) Add(val NodeInfo) (ok bool, err error) {
@@ -106,91 +143,70 @@ func (a *Amigo) Add(val NodeInfo) (ok bool, err error) {
 	idx := GetDistanceIndex(a.self, val.ID)
 	if a.buckets[idx] == nil {
 		a.buckets[idx] = NewBucket(K)
+		if a.closestNonEmpty > idx {
+			a.closestNonEmpty = idx
+		}
 	}
 
 	if added := a.buckets[idx].Append(val, defaultAliveCheck); added {
-		a.total++
 		return true, nil
 	}
 
 	return false, nil
 }
 
-func (a *Amigo) Lookup(nodeID ID) []NodeInfo {
-	nodes := a.GetInitialCloseNodes(nodeID)
-	a.lookup(nodeID, nodes)
+func (a *Amigo) Lookup(target ID) []NodeInfo {
+	nodes := a.GetKClosest() // my K closest friends
+	a.lookup(target, nodes)
 }
 
-func (a *Amigo) lookup(nodeID ID, querys []NodeInfo) {
-	closestNode, closestDist := GetClosestTo(nodeID, querys)
-	seen := make(map[ID]struct{})
-
-BATCH:
-	for j := 0; j < len(querys); j += Alpha {
-		wg := sync.WaitGroup{}
-		var resCHs []chan []NodeInfo
-		if j+Alpha > len(querys) {
-			wg.Add(len(querys) - j)
-			resCHs = make([]chan []NodeInfo, len(querys)-j)
-		} else {
-			wg.Add(Alpha)
-			resCHs = make([]chan []NodeInfo, Alpha)
-		}
-
-		mtx := sync.Mutex{}
-
-		for i := 0; i < Alpha; i++ {
-			if j+i > len(querys) {
-				break
-			}
-			seen[querys[j+i].ID] = struct{}{}
-
-			go func(ci int) {
-				res, err := a.query(querys[j+ci], nodeID)
-				mtx.Lock()
-				if err != nil {
-					resCHs[ci] <- nil
-				} else {
-					resCHs[ci] <- res
-				}
-				mtx.Unlock()
-			}(i)
-		}
-
-		wg.Wait()
-
-		aggrRes := make([]NodeInfo, 0)
-		for _, c := range resCHs {
-			if r := <-c; r != nil {
-				aggrRes = append(aggrRes, r...)
-			}
-		}
-
-		kClose := a.GetKClosest(aggrRes)
-		closer := false
-		for _, newNode := range kClose {
-			if closestDist.Cmp(GetDistance(nodeID, newNode.ID)) > 0 {
-				closer = true
-				break
-			}
-		}
-
-		if closer {
-			a.lookup(nodeID, kClose)
-		} else {
-			break BATCH
-		}
+func (a *Amigo) getAlphaNodesByRTT(nodes []NodeInfo) []NodeInfo {
+	if len(nodes) <= Alpha {
+		return nodes
 	}
+	sort.Sort(byRTT(nodes))
+	return nodes[:Alpha]
 }
 
-func (a *Amigo) GetInitialCloseNodes(id ID) []NodeInfo {
-	idx := GetDistanceIndex(a.self, id)
+func (a *Amigo) getAlphaNodesByRand(nodes []NodeInfo) []NodeInfo {
+	if len(nodes) <= Alpha {
+		return nodes
+	}
+
+	perm := rand.Perm(len(nodes))
 	ret := make([]NodeInfo, 0, Alpha)
-	for idx >= 0 {
-		ret = append(ret, a.buckets[idx].GetN(Alpha-len(ret))...)
-		idx--
+	for i := range perm {
+		ret = append(ret, nodes[perm[i]])
 	}
 	return ret
+}
+
+func (a *Amigo) lookup(target ID, nodes []NodeInfo) {
+	closestNode, closestDist := GetClosestTo(target, nodes) // closest info in this round
+	seen := make(map[ID]struct{})
+
+	if len(nodes) > K {
+		nodes = a.GetKClosestTo(target, nodes)
+	}
+
+	for len(seen) < K && len(nodes) > 0 {
+		alphas := a.getAlphaNodesByRand(nodes)
+		nodes = removeFromSlice(alphas, nodes)
+		newNodes, seen := a.query(target, alphas, seen)
+
+		_, dist := GetClosestTo(target, newNodes)
+		if closestDist.Cmp(dist) == -1 {
+			newNodes, seen = a.query(target, nodes, seen)
+		} else {
+			// getting closer
+			a.lookup(target, newNodes)
+		}
+	}
+
+}
+
+func (a *Amigo) Start() {
+
 }
 
 func (a *Amigo) Ping(val NodeInfo) bool {
@@ -214,28 +230,37 @@ func (a *Amigo) removeSeen(seen map[ID]struct{}, cand []NodeInfo) []NodeInfo {
 	return ret
 }
 
-func (a *Amigo) query(queryNode NodeInfo, queryID ID) ([]NodeInfo, error) {
-	return nil, nil
+func (a *Amigo) query(queryID ID, queryNodes []NodeInfo, seen map[ID]struct{}) ([]NodeInfo, map[ID]struct{}) {
+	for i := range queryNodes {
+		seen[queryNodes[i].ID] = struct{}{}
+	}
+
+	newNodes := fromRPC()
+
+	for _, n := range newNodes {
+		a.Add(n)
+	}
+	return newNodes, seen
 }
 
-// TODO: use a better sort algorithm
-func (a *Amigo) GetKClosest(nodes []NodeInfo) []NodeInfo {
-	if len(nodes) <= K {
-		return nodes
-	}
-
-	for j := 0; j < K; j++ {
-		closest := GetDistance(a.self, nodes[j].ID)
-		idx := j
-		for i := j + 1; i < len(nodes); i++ {
-			dist := GetDistance(a.self, nodes[i].ID)
-			if closest.Cmp(dist) == 1 {
-				closest = dist
-				idx = i
+func removeFromSlice(toRemove []NodeInfo, slice []NodeInfo) []NodeInfo {
+	for r := range toRemove {
+		for s := range slice {
+			if toRemove[r].ID == slice[s].ID {
+				if s == 0 {
+					slice = slice[1:]
+				} else if s == len(slice)-1 {
+					slice = slice[:s]
+				} else {
+					slice = append(slice[0:s], slice[s+1:]...)
+				}
+				break
 			}
 		}
-		nodes[j], nodes[idx] = nodes[idx], nodes[j]
 	}
+	return slice
+}
 
-	return nodes[:K]
+func (a *Amigo) Print() {
+
 }
